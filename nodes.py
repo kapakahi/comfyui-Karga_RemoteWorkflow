@@ -185,9 +185,9 @@ def _upload_mask(remote_address: str, mask_tensor) -> str:
 # ── Node ──────────────────────────────────────────────────────────────────────
 
 # Reserved labels handled explicitly — excluded from dynamic [ui] field discovery.
-# "seed" is reserved because noise_seed already provides the seed widget + randomizer.
+# "seed" is reserved because the fixed seed input already provides the widget + randomizer.
 RESERVED = {
-    "workflow", "remote_address", "prompt", "noise_seed", "seed",
+    "workflow", "remote_address", "prompt", "seed",
     "image", "mask", "poll_interval", "timeout", "image_index",
 }
 
@@ -223,7 +223,7 @@ class KargaRemoteWorkflow:
             "workflow":       (workflows, {}),
             "remote_address": ("STRING", {"default": "192.168.1.50:8188", "multiline": False}),
             "prompt":         ("STRING", {"default": "", "multiline": True}),
-            "noise_seed":     ("INT",    {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+            "seed":           ("INT",    {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
             "poll_interval":  ("FLOAT",  {"default": 1.0, "min": 0.25, "max": 10.0,  "step": 0.25}),
             "timeout":        ("INT",    {"default": 180, "min": 10,   "max": 600,   "step": 10}),
             "image_index":    ("INT",    {"default": 0,   "min": 0,    "max": 99}),
@@ -237,7 +237,7 @@ class KargaRemoteWorkflow:
     CATEGORY      = "Karga"
     OUTPUT_NODE   = True
 
-    def run(self, workflow, remote_address, prompt, noise_seed,
+    def run(self, workflow, remote_address, prompt, seed,
             image=None, mask=None, poll_interval=1.0, timeout=180, image_index=0, **ui_values):
 
         # ── Load workflow ──────────────────────────────────────────────────────
@@ -263,7 +263,7 @@ class KargaRemoteWorkflow:
         # "seed" maps to the [ui]-tagged RandomNoise node (label="seed").
         injections = dict(ui_values)
         injections["prompt"] = prompt
-        injections["seed"]   = noise_seed
+        injections["seed"]   = seed
 
         applied   = []
         unmatched = []
