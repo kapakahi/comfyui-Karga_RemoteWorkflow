@@ -117,23 +117,8 @@ def _find_ui_nodes(workflow: dict) -> dict:
     return ui_map
 
 
-def _upload_image(remote_address: str, img_tensor, filename: str = None) -> str:
-    """
-    Upload a [1,H,W,C] IMAGE (torch.Tensor or np.ndarray) to /upload/image.
-    Returns the filename the server assigned.
-    """
-    frame = img_tensor[0]
-    if hasattr(frame, "cpu"):
-        frame = frame.cpu().numpy()
-    img_np  = (np.array(frame) * 255).clip(0, 255).astype(np.uint8)
-    pil_img = Image.fromarray(img_np)
-    buf     = io.BytesIO()
-    pil_img.save(buf, format="PNG")
-    img_bytes = buf.getvalue()
-
-    if filename is None:
-        filename = f"rwf_input_{uuid.uuid4().hex[:8]}.png"
-
+def _post_upload(remote_address: str, img_bytes: bytes, filename: str) -> str:
+    """POST raw image bytes to /upload/image. Returns the filename the server assigned."""
     boundary = uuid.uuid4().hex
     body = (
         f"--{boundary}\r\n"
@@ -153,22 +138,61 @@ def _upload_image(remote_address: str, img_tensor, filename: str = None) -> str:
     )
     with urllib.request.urlopen(req, timeout=30) as res:
         result = json.loads(res.read())
+    return result.get("name", filename)
 
-    assigned = result.get("name", filename)
+
+def _upload_image(remote_address: str, img_tensor, filename: str = None) -> str:
+    """
+    Upload a [1,H,W,C] IMAGE (torch.Tensor or np.ndarray) to /upload/image.
+    Returns the filename the server assigned.
+    """
+    frame = img_tensor[0]
+    if hasattr(frame, "cpu"):
+        frame = frame.cpu().numpy()
+    img_np  = (np.array(frame) * 255).clip(0, 255).astype(np.uint8)
+    pil_img = Image.fromarray(img_np)
+    buf     = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+
+    if filename is None:
+        filename = f"rwf_input_{uuid.uuid4().hex[:8]}.png"
+
+    assigned = _post_upload(remote_address, buf.getvalue(), filename)
     print(f"[KargaRemoteWorkflow] Uploaded input image → {assigned}")
+    return assigned
+
+
+def _upload_mask(remote_address: str, mask_tensor) -> str:
+    """
+    Upload a [B,H,W] or [H,W] MASK (torch.Tensor or np.ndarray) to /upload/image.
+    Returns the filename the server assigned.
+    """
+    # MASK tensors are [B,H,W]; take first frame to get [H,W]
+    mask_frame = mask_tensor[0] if mask_tensor.ndim == 3 else mask_tensor
+    if hasattr(mask_frame, "cpu"):
+        mask_frame = mask_frame.cpu().numpy()
+    mask_np  = (np.array(mask_frame) * 255).clip(0, 255).astype(np.uint8)
+    pil_mask = Image.fromarray(mask_np, mode="L")
+    buf      = io.BytesIO()
+    pil_mask.save(buf, format="PNG")
+
+    filename = f"rwf_mask_{uuid.uuid4().hex[:8]}.png"
+    assigned = _post_upload(remote_address, buf.getvalue(), filename)
+    print(f"[KargaRemoteWorkflow] Uploaded mask → {assigned}")
     return assigned
 
 
 # ── Node ──────────────────────────────────────────────────────────────────────
 
-# Reserved labels handled explicitly — excluded from dynamic [ui] field discovery
-RESERVED  = {"workflow", "remote_address", "prompt", "noise_seed",
-             "image", "mask", "poll_interval", "timeout", "image_index"}
-
+# Reserved labels handled explicitly — excluded from dynamic [ui] field discovery.
+# "seed" is reserved because noise_seed already provides the seed widget + randomizer.
+RESERVED = {
+    "workflow", "remote_address", "prompt", "noise_seed", "seed",
+    "image", "mask", "poll_interval", "timeout", "image_index",
+}
 
 
 class KargaRemoteWorkflow:
-
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -192,8 +216,8 @@ class KargaRemoteWorkflow:
                         ui_fields[label] = ("FLOAT", {"default": existing, "min": -999999.0, "max": 999999.0, "step": 0.01})
                     else:
                         ui_fields[label] = ("STRING", {"default": str(existing) if existing is not None else "", "multiline": False})
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[KargaRemoteWorkflow] WARNING — could not parse workflow for dynamic fields: {e}")
 
         required = {
             "workflow":       (workflows, {}),
@@ -216,8 +240,6 @@ class KargaRemoteWorkflow:
     def run(self, workflow, remote_address, prompt, noise_seed,
             image=None, mask=None, poll_interval=1.0, timeout=180, image_index=0, **ui_values):
 
-        resolved_seed = noise_seed
-
         # ── Load workflow ──────────────────────────────────────────────────────
         wf_data = _load_workflow(workflow)
         ui_map  = _find_ui_nodes(wf_data)
@@ -227,51 +249,21 @@ class KargaRemoteWorkflow:
 
         # ── Normalise remote address ───────────────────────────────────────────
         remote_address = remote_address.strip().rstrip("/")
-        if not remote_address.startswith("http"):
+        if not remote_address.startswith(("http://", "https://")):
             remote_address = "http://" + remote_address
 
         # ── Upload input image (optional) ──────────────────────────────────────
         uploaded_filename = _upload_image(remote_address, image) if image is not None else None
 
         # ── Upload mask (optional) ─────────────────────────────────────────────
-        uploaded_mask_filename = None
-        if mask is not None:
-            # MASK is [H,W] float32; convert to grayscale PNG
-            mask_frame = mask[0] if mask.ndim == 3 else mask
-            if hasattr(mask_frame, "cpu"):
-                mask_frame = mask_frame.cpu().numpy()
-            mask_np  = (np.array(mask_frame) * 255).clip(0, 255).astype(np.uint8)
-            pil_mask = Image.fromarray(mask_np, mode="L")
-            buf      = io.BytesIO()
-            pil_mask.save(buf, format="PNG")
-            mask_bytes    = buf.getvalue()
-            mask_filename = f"rwf_mask_{uuid.uuid4().hex[:8]}.png"
-            boundary      = uuid.uuid4().hex
-            body = (
-                f"--{boundary}\r\n"
-                f'Content-Disposition: form-data; name="image"; filename="{mask_filename}"\r\n'
-                f"Content-Type: image/png\r\n\r\n"
-            ).encode("utf-8") + mask_bytes + (
-                f"\r\n--{boundary}\r\n"
-                f'Content-Disposition: form-data; name="overwrite"\r\n\r\n'
-                f"true\r\n"
-                f"--{boundary}--\r\n"
-            ).encode("utf-8")
-            req = urllib.request.Request(
-                f"{remote_address}/upload/image",
-                data=body,
-                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-            )
-            with urllib.request.urlopen(req, timeout=30) as res:
-                result = json.loads(res.read())
-            uploaded_mask_filename = result.get("name", mask_filename)
-            print(f"[KargaRemoteWorkflow] Uploaded mask → {uploaded_mask_filename}")
+        uploaded_mask_filename = _upload_mask(remote_address, mask) if mask is not None else None
 
         # ── Inject all values into workflow ────────────────────────────────────
-        # Build a flat dict: dynamic ui_values + the fixed inputs we own
+        # Build a flat dict: dynamic ui_values + the fixed inputs we own.
+        # "seed" maps to the [ui]-tagged RandomNoise node (label="seed").
         injections = dict(ui_values)
         injections["prompt"] = prompt
-        injections["seed"]   = resolved_seed
+        injections["seed"]   = noise_seed
 
         applied   = []
         unmatched = []
@@ -395,9 +387,9 @@ class KargaRemoteWorkflow:
 # ── Registration ──────────────────────────────────────────────────────────────
 
 NODE_CLASS_MAPPINGS = {
-    "Karga": KargaRemoteWorkflow,
+    "KargaRemoteWorkflow": KargaRemoteWorkflow,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "Karga": "Remote Workflow",
+    "KargaRemoteWorkflow": "Remote Workflow",
 }

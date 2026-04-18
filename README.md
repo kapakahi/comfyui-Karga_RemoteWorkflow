@@ -15,7 +15,7 @@ A standalone ComfyUI custom node that sends workflows to a remote ComfyUI instan
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/YOUR_USERNAME/KargaRemoteWorkflow
+git clone https://github.com/kapakahi/comfyui-Karga_RemoteWorkflow
 ```
 
 Restart ComfyUI. The **Karga Remote Workflow** node will appear under the `Karga` category.
