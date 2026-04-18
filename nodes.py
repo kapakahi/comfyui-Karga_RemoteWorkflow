@@ -117,6 +117,53 @@ def _find_ui_nodes(workflow: dict) -> dict:
     return ui_map
 
 
+def _frames_from_mp4(mp4_bytes: bytes) -> list:
+    """
+    Extract frames from raw mp4 bytes. Returns a list of float32 [H,W,C] numpy arrays.
+    Tries imageio+imageio-ffmpeg first, falls back to cv2.
+    """
+    try:
+        import imageio
+        import imageio_ffmpeg  # noqa: F401 — ensures ffmpeg backend is available
+        buf = io.BytesIO(mp4_bytes)
+        reader = imageio.get_reader(buf, format="mp4")
+        frames = [np.array(f).astype(np.float32) / 255.0 for f in reader]
+        reader.close()
+        return frames
+    except ImportError:
+        pass
+
+    try:
+        import cv2
+        arr = np.frombuffer(mp4_bytes, dtype=np.uint8)
+        cap = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+        # imdecode only gets one frame; use VideoCapture via temp file
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp.write(mp4_bytes)
+            tmp_path = tmp.name
+        cap = cv2.VideoCapture(tmp_path)
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(frame.astype(np.float32) / 255.0)
+        cap.release()
+        os.unlink(tmp_path)
+        return frames
+    except ImportError:
+        pass
+
+    raise RuntimeError(
+        "[KargaRemoteWorkflow] Cannot decode mp4 — install imageio and imageio-ffmpeg, or opencv-python:\n"
+        "  pip install imageio imageio-ffmpeg\n"
+        "  # or\n"
+        "  pip install opencv-python"
+    )
+
+
 def _post_upload(remote_address: str, img_bytes: bytes, filename: str) -> str:
     """POST raw image bytes to /upload/image. Returns the filename the server assigned."""
     boundary = uuid.uuid4().hex
@@ -351,37 +398,65 @@ class KargaRemoteWorkflow:
                 f"[KargaRemoteWorkflow] Job {prompt_id} did not finish within {timeout}s"
             )
 
-        # ── Fetch output image ─────────────────────────────────────────────────
-        all_images = []
+        # ── Fetch output frames (images or video) ─────────────────────────────
+        all_frames = []
+        is_video   = False
+
         for node_output in history[prompt_id]["outputs"].values():
-            if "images" not in node_output:
-                continue
-            for img_info in node_output["images"]:
-                params = urllib.parse.urlencode({
-                    "filename":  img_info["filename"],
-                    "subfolder": img_info.get("subfolder", ""),
-                    "type":      img_info.get("type", "output"),
-                })
-                try:
-                    with urllib.request.urlopen(
-                        f"{remote_address}/view?{params}", timeout=30
-                    ) as res:
-                        img_data = res.read()
-                    img    = Image.open(io.BytesIO(img_data)).convert("RGB")
-                    img_np = np.array(img).astype(np.float32) / 255.0
-                    all_images.append(img_np)
-                except Exception as e:
-                    print(f"[KargaRemoteWorkflow] Failed to fetch {img_info}: {e}")
 
-        if not all_images:
-            raise Exception(f"[KargaRemoteWorkflow] No images in output for job {prompt_id}")
+            # Still images
+            if "images" in node_output:
+                for img_info in node_output["images"]:
+                    params = urllib.parse.urlencode({
+                        "filename":  img_info["filename"],
+                        "subfolder": img_info.get("subfolder", ""),
+                        "type":      img_info.get("type", "output"),
+                    })
+                    try:
+                        with urllib.request.urlopen(
+                            f"{remote_address}/view?{params}", timeout=30
+                        ) as res:
+                            img_data = res.read()
+                        img    = Image.open(io.BytesIO(img_data)).convert("RGB")
+                        img_np = np.array(img).astype(np.float32) / 255.0
+                        all_frames.append(img_np)
+                    except Exception as e:
+                        print(f"[KargaRemoteWorkflow] Failed to fetch image {img_info}: {e}")
 
-        idx = min(image_index, len(all_images) - 1)
-        if idx != image_index:
-            print(f"[KargaRemoteWorkflow] image_index {image_index} out of range, using {idx}")
+            # Video files (VHS mp4 output)
+            if "gifs" in node_output:
+                for vid_info in node_output["gifs"]:
+                    params = urllib.parse.urlencode({
+                        "filename":  vid_info["filename"],
+                        "subfolder": vid_info.get("subfolder", ""),
+                        "type":      vid_info.get("type", "output"),
+                    })
+                    try:
+                        with urllib.request.urlopen(
+                            f"{remote_address}/view?{params}", timeout=60
+                        ) as res:
+                            vid_data = res.read()
+                        frames = _frames_from_mp4(vid_data)
+                        all_frames.extend(frames)
+                        is_video = True
+                        print(f"[KargaRemoteWorkflow] Extracted {len(frames)} frames from {vid_info['filename']}")
+                    except Exception as e:
+                        print(f"[KargaRemoteWorkflow] Failed to fetch video {vid_info}: {e}")
 
-        print(f"[KargaRemoteWorkflow] Returning image {idx + 1}/{len(all_images)}")
-        return (torch.from_numpy(np.expand_dims(all_images[idx], 0)),)
+        if not all_frames:
+            raise Exception(f"[KargaRemoteWorkflow] No output frames for job {prompt_id}")
+
+        if is_video:
+            # Return all frames as a batch tensor [B,H,W,C]
+            print(f"[KargaRemoteWorkflow] Returning video batch: {len(all_frames)} frames")
+            batch = np.stack(all_frames, axis=0)
+            return (torch.from_numpy(batch),)
+        else:
+            idx = min(image_index, len(all_frames) - 1)
+            if idx != image_index:
+                print(f"[KargaRemoteWorkflow] image_index {image_index} out of range, using {idx}")
+            print(f"[KargaRemoteWorkflow] Returning image {idx + 1}/{len(all_frames)}")
+            return (torch.from_numpy(np.expand_dims(all_frames[idx], 0)),)
 
 
 # ── Registration ──────────────────────────────────────────────────────────────
