@@ -205,7 +205,7 @@ class KargaRemoteWorkflow:
                 wf     = _load_workflow(workflows[0])
                 ui_map = _find_ui_nodes(wf)
                 for label, (node_id, input_key) in ui_map.items():
-                    if label in RESERVED or input_key == "image":
+                    if label in RESERVED or input_key in ("image", "seed", "noise_seed"):
                         continue
                     existing = wf[node_id]["inputs"].get(input_key)
                     if isinstance(existing, bool):
