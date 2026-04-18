@@ -1,0 +1,13 @@
+# Ignore user workflow files — add your own JSONs to workflows/ without committing them
+workflows/*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/
