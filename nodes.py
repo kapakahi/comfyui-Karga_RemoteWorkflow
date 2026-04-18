@@ -204,12 +204,9 @@ class KargaRemoteWorkflow:
             if workflows and workflows[0] != "(no workflows found)":
                 wf     = _load_workflow(workflows[0])
                 ui_map = _find_ui_nodes(wf)
-                print(f"[KargaRemoteWorkflow] ui_map: {ui_map}")
                 for label, (node_id, input_key) in ui_map.items():
                     if label in RESERVED or input_key in ("image", "seed", "noise_seed"):
-                        print(f"[KargaRemoteWorkflow] SKIPPED dynamic field: label={label!r} input_key={input_key!r}")
                         continue
-                    print(f"[KargaRemoteWorkflow] ADDED dynamic field: label={label!r} input_key={input_key!r}")
                     existing = wf[node_id]["inputs"].get(input_key)
                     if isinstance(existing, bool):
                         ui_fields[label] = ("BOOLEAN", {"default": existing})
