@@ -9,12 +9,15 @@ Single node that:
   - Queues the job on a remote ComfyUI instance and returns the output image
 
 [ui] Tag Convention (in your remote workflow):
-  Rename any node's title to:   [ui] label_name:input_field
-  Example:                      [ui] prompt:text
-                                [ui] steps:steps
-                                [ui] seed:seed
-                                [ui] cfg:cfg
-                                [ui] input_image:image
+  Add [ui] anywhere in a node's title for automatic detection:
+    "CLIP Text Encode [ui]"        -> prompt field (text)
+    "KSampler [ui]"                -> seed field
+    "Load Image [ui]"              -> input_image field
+    "Checkpoint Loader [ui]"       -> model field
+
+  For custom label/input override:  [ui] label_name:input_field
+    "[ui] steps:steps"
+    "[ui] cfg:cfg"
 """
 
 import json
@@ -52,26 +55,35 @@ def _load_workflow(filename: str) -> dict:
 
 def _find_ui_nodes(workflow: dict) -> dict:
     """
-    Scans workflow for nodes tagged with [ui] anywhere in _meta.title.
+    Scans workflow for nodes with [ui] anywhere in _meta.title.
 
-    Supports two formats:
-      Prefix:  [ui] label_name:input_key   e.g. "[ui] prompt:text"
-      Suffix:  Title ending with [ui]      e.g. "Load Image [ui]"
-                                                 "CLIP Text Encode (Positive Prompt) [ui]"
-                                                 "RandomNoise [ui]"
+    Simple tag:    any title containing [ui]  e.g. "CLIP Text Encode [ui]"
+                                                    "[ui] My Node"
+                                                    "KSampler [ui] advanced"
+    Explicit override: [ui] label:input_key   e.g. "[ui] prompt:text"
 
-    For suffix-style nodes the label/input_key are inferred from class_type:
-      LoadImage      -> label="input_image", input_key="image"
-      CLIPTextEncode -> label="prompt",      input_key="text"
-      RandomNoise    -> label="seed",        input_key="noise_seed"
+    Class-type auto-detection (simple tag):
+      CLIPTextEncode / CLIPTextEncodeSDXL -> label="prompt",      input_key="text" / "text_g"
+      KSampler / KSamplerAdvanced         -> label="seed",        input_key="seed" / "noise_seed"
+      RandomNoise                         -> label="seed",        input_key="noise_seed"
+      LoadImage                           -> label="input_image", input_key="image"
+      LoadImageMask                       -> label="input_mask",  input_key="image"
+      CheckpointLoaderSimple              -> label="model",       input_key="ckpt_name"
+      LoraLoader                          -> label="lora",        input_key="lora_name"
+      (unknown)                           -> first scalar input,  class_type as label
 
     Returns:  { "label_name": ("node_id", "input_key"), ... }
     """
-    SUFFIX_CLASS_MAP = {
-        "LoadImage":      ("input_image", "image"),
-        "LoadImageMask":  ("input_mask",  "image"),
-        "CLIPTextEncode": ("prompt",      "text"),
-        "RandomNoise":    ("seed",        "noise_seed"),
+    CLASS_MAP = {
+        "CLIPTextEncode":         ("prompt",      "text"),
+        "CLIPTextEncodeSDXL":     ("prompt",      "text_g"),
+        "KSampler":               ("seed",        "seed"),
+        "KSamplerAdvanced":       ("seed",        "noise_seed"),
+        "RandomNoise":            ("seed",        "noise_seed"),
+        "LoadImage":              ("input_image", "image"),
+        "LoadImageMask":          ("input_mask",  "image"),
+        "CheckpointLoaderSimple": ("model",       "ckpt_name"),
+        "LoraLoader":             ("lora",        "lora_name"),
     }
 
     ui_map = {}
@@ -82,37 +94,35 @@ def _find_ui_nodes(workflow: dict) -> dict:
         title_low  = title.lower()
         class_type = node.get("class_type", "")
 
-        if title_low.startswith("[ui]"):
-            # Prefix format: [ui] label:input_key
-            body = title[4:].strip()
-            if ":" in body:
-                label, input_key = body.split(":", 1)
-                label     = label.strip()
-                input_key = input_key.strip()
-            else:
-                label     = body.strip()
-                input_key = next(
-                    (k for k, v in node.get("inputs", {}).items() if isinstance(v, str)),
-                    None,
-                )
+        if "[ui]" not in title_low:
+            continue
+
+        # Explicit override: find "[ui] label:input_key" anywhere in the title
+        ui_pos = title_low.find("[ui]")
+        after  = title[ui_pos + 4:].strip()
+        if ":" in after and not after.startswith(":"):
+            label, input_key = after.split(":", 1)
+            label     = label.strip()
+            input_key = input_key.strip()
             if label and input_key:
                 ui_map[label] = (node_id, input_key)
+                continue
 
-        elif title_low.endswith("[ui]"):
-            # Suffix format: infer from class_type
-            if class_type in SUFFIX_CLASS_MAP:
-                label, input_key = SUFFIX_CLASS_MAP[class_type]
-                ui_map[label] = (node_id, input_key)
-            else:
-                # Fallback: first scalar input
-                input_key = next(
-                    (k for k, v in node.get("inputs", {}).items()
-                     if isinstance(v, (str, int, float))),
-                    None,
-                )
-                label = class_type.lower()
-                if label and input_key:
-                    ui_map[label] = (node_id, input_key)
+        # Auto-detect from class_type
+        if class_type in CLASS_MAP:
+            label, input_key = CLASS_MAP[class_type]
+            ui_map[label] = (node_id, input_key)
+            continue
+
+        # Fallback: first scalar input, class_type as label
+        input_key = next(
+            (k for k, v in node.get("inputs", {}).items()
+             if isinstance(v, (str, int, float))),
+            None,
+        )
+        label = class_type.lower()
+        if label and input_key:
+            ui_map[label] = (node_id, input_key)
 
     return ui_map
 
